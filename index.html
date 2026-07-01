@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1" />
+<title>SIGNAL — Client-Side IPTV Player</title>
+<meta name="description" content="A fully client-side IPTV player. Load an M3U playlist and watch HLS streams directly in your browser." />
+
+<!-- ============================================================
+     FONTS
+     Space Grotesk  -> display/headings (broadcast signage feel)
+     Inter           -> body copy (neutral, readable)
+     JetBrains Mono  -> channel numbers, tags, technical readouts
+============================================================ -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+
+<!-- ============================================================
+     TAILWIND (Play CDN build) — configured with our design tokens
+     so we can use classes like bg-panel, text-accent, font-display, etc.
+============================================================ -->
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+  tailwind.config = {
+    darkMode: 'class',
+    theme: {
+      extend: {
+        colors: {
+          base:      '#0A0C10', // page background
+          panel:     '#12151B', // cards / sidebar / header
+          panel2:    '#181C24', // nested panels / inputs
+          hairline:  '#22262F', // borders
+          accent:    '#FFB000', // signal amber — primary interactive color
+          accent2:   '#2DD4BF', // teal — "live" / success accents
+          danger:    '#FF5D5D',
+          ink:       '#E7E9EC', // primary text
+          muted:     '#8B93A1', // secondary text
+          faint:     '#565D6B', // tertiary text
+        },
+        fontFamily: {
+          display: ['"Space Grotesk"', 'sans-serif'],
+          body: ['"Inter"', 'sans-serif'],
+          mono: ['"JetBrains Mono"', 'monospace'],
+        },
+        boxShadow: {
+          glow: '0 0 0 1px rgba(255,176,0,0.35), 0 0 24px rgba(255,176,0,0.15)',
+        },
+      },
+    },
+  };
+</script>
+
+<!-- ============================================================
+     HLS.js — plays .m3u8 (HLS) streams in browsers that don't
+     support HLS natively (Chrome, Firefox, Edge, desktop).
+     Safari supports HLS natively via <video>, handled in JS below.
+============================================================ -->
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.15/dist/hls.min.js"></script>
+
+<style>
+  /* Custom scrollbars — thin, matches the console aesthetic */
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-track { background: #12151B; }
+  ::-webkit-scrollbar-thumb { background: #2A2F3A; border-radius: 4px; }
+  ::-webkit-scrollbar-thumb:hover { background: #3A414F; }
+  * { scrollbar-width: thin; scrollbar-color: #2A2F3A #12151B; }
+
+  html, body { background: #0A0C10; }
+
+  /* Subtle CRT scanline overlay on the player — the "signature" visual detail.
+     Purely decorative, sits above the video, ignores pointer events. */
+  .scanlines::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    background: repeating-linear-gradient(
+      to bottom,
+      rgba(255,255,255,0.025) 0px,
+      rgba(255,255,255,0.025) 1px,
+      transparent 1px,
+      transparent 3px
+    );
+    mix-blend-mode: overlay;
+    z-index: 5;
+  }
+
+  /* Brief "tuning static" flash used when switching channels */
+  @keyframes tune-flash {
+    0%   { opacity: 0.35; }
+    100% { opacity: 0; }
+  }
+  .tune-flash {
+    position: absolute;
+    inset: 0;
+    background: repeating-linear-gradient(45deg, #444 0 2px, #111 2px 4px);
+    animation: tune-flash 0.35s ease-out forwards;
+    pointer-events: none;
+    z-index: 6;
+  }
+
+  @keyframes pulse-dot {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.35; }
+  }
+  .live-dot { animation: pulse-dot 1.6s ease-in-out infinite; }
+
+  /* Loading spinner ring */
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .spin { animation: spin 0.9s linear infinite; }
+
+  /* Channel card focus / hover ring uses the accent glow token */
+  .card-interactive:hover, .card-interactive:focus-visible {
+    box-shadow: 0 0 0 1px rgba(255,176,0,0.35), 0 0 24px rgba(255,176,0,0.12);
+  }
+
+  input:focus-visible, button:focus-visible, [tabindex]:focus-visible {
+    outline: 2px solid #FFB000;
+    outline-offset: 2px;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .live-dot, .tune-flash, .spin { animation: none !important; }
+  }
+</style>
+</head>
+
+<body class="bg-base text-ink font-body min-h-screen flex flex-col">
+
+  <!-- ============================================================
+       TOP BAR
+       Brand mark, global search, view toggle, settings trigger.
+  ============================================================ -->
+  <header class="sticky top-0 z-40 bg-panel/95 backdrop-blur border-b border-hairline">
+    <div class="flex items-center gap-3 px-3 sm:px-4 h-14">
+
+      <!-- Mobile sidebar toggle -->
+      <button id="btn-toggle-sidebar" aria-label="Toggle channel groups"
+        class="lg:hidden p-2 -ml-2 rounded-md text-muted hover:text-ink hover:bg-panel2 transition">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
+      </button>
+
+      <!-- Brand -->
+      <div class="flex items-center gap-2 shrink-0">
+        <span class="w-2.5 h-2.5 rounded-full bg-accent2 live-dot"></span>
+        <span class="font-display font-700 text-lg tracking-tight">SIGNAL</span>
+        <span class="hidden sm:inline text-[11px] font-mono text-faint border border-hairline rounded px-1.5 py-0.5">IPTV.CLIENT</span>
+      </div>
+
+      <!-- Search -->
+      <div class="flex-1 max-w-md ml-1">
+        <div class="relative">
+          <svg class="absolute left-3 top-1/2 -translate-y-1/2 text-faint" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+          <input id="input-search" type="text" placeholder="Search channels…"
+            class="w-full bg-panel2 border border-hairline rounded-md pl-9 pr-3 py-2 text-sm placeholder:text-faint focus:border-accent transition" />
+        </div>
+      </div>
+
+      <!-- View toggle -->
+      <div class="hidden sm:flex items-center bg-panel2 border border-hairline rounded-md p-0.5">
+        <button id="btn-view-grid" title="Grid view" class="view-btn p-1.5 rounded text-ink bg-hairline/60">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>
+        </button>
+        <button id="btn-view-list" title="List view" class="view-btn p-1.5 rounded text-muted">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/></svg>
+        </button>
+      </div>
+
+      <!-- Settings -->
+      <button id="btn-open-settings" title="Playlist & connection settings"
+        class="p-2 rounded-md text-muted hover:text-ink hover:bg-panel2 transition">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <!-- ============================================================
+       NOTICE / TOAST STACK
+       Used for CORS failures, stream errors, load confirmations.
+  ============================================================ -->
+  <div id="notice-stack" class="fixed top-16 right-3 z-50 flex flex-col gap-2 w-[min(92vw,380px)]"></div>
+
+  <!-- ============================================================
+       LAYOUT: sidebar (groups) + main (player + channel browser)
+  ============================================================ -->
+  <div class="flex-1 flex overflow-hidden">
+
+    <!-- Sidebar backdrop for mobile drawer -->
+    <div id="sidebar-backdrop" class="fixed inset-0 bg-black/60 z-30 hidden lg:hidden"></div>
+
+    <!-- SIDEBAR -->
+    <aside id="sidebar"
+      class="fixed lg:static z-40 top-14 lg:top-0 bottom-0 left-0 w-72 -translate-x-full lg:translate-x-0 transition-transform duration-200 bg-panel border-r border-hairline flex flex-col">
+      <div class="p-3 border-b border-hairline">
+        <p class="font-display text-xs font-600 tracking-widest text-faint uppercase">Groups</p>
+      </div>
+      <div id="group-list" class="flex-1 overflow-y-auto p-2 space-y-0.5">
+        <!-- populated by JS: renderGroups() -->
+      </div>
+      <div class="p-3 border-t border-hairline">
+        <p id="playlist-summary" class="text-xs text-faint font-mono leading-relaxed">No playlist loaded</p>
+      </div>
+    </aside>
+
+    <!-- MAIN -->
+    <main class="flex-1 min-w-0 overflow-y-auto">
+
+      <!-- PLAYER -->
+      <section class="p-3 sm:p-4">
+        <div class="relative w-full aspect-video bg-black rounded-lg overflow-hidden border border-hairline scanlines">
+          <video id="video-player" class="w-full h-full" controls playsinline></video>
+
+          <!-- Empty state -->
+          <div id="player-empty" class="absolute inset-0 flex flex-col items-center justify-center gap-2 text-center px-6 pointer-events-none">
+            <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#565D6B" stroke-width="1.5"><rect x="2" y="7" width="20" height="14" rx="2"/><path d="m17 2-5 5-5-5"/></svg>
+            <p class="text-muted text-sm font-display">No channel tuned in</p>
+            <p class="text-faint text-xs">Load a playlist and select a channel to begin.</p>
+          </div>
+
+          <!-- Loading state -->
+          <div id="player-loading" class="absolute inset-0 hidden flex-col items-center justify-center gap-2 bg-black/70">
+            <div class="w-8 h-8 border-2 border-accent border-t-transparent rounded-full spin"></div>
+            <p class="text-xs font-mono text-muted">TUNING…</p>
+          </div>
+
+          <!-- Fatal error state -->
+          <div id="player-error" class="absolute inset-0 hidden flex-col items-center justify-center gap-2 bg-black/80 px-6 text-center">
+            <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#FF5D5D" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 8v5M12 16h.01"/></svg>
+            <p id="player-error-text" class="text-sm text-ink font-display">Playback failed</p>
+            <p class="text-xs text-faint max-w-sm">This is usually a dead stream or a CORS restriction from the source server. Try the CORS proxy option in Settings.</p>
+          </div>
+        </div>
+
+        <!-- Now playing strip -->
+        <div class="flex items-center gap-3 mt-3">
+          <img id="np-logo" class="w-10 h-10 rounded-md object-cover bg-panel2 border border-hairline hidden" alt="" />
+          <div class="min-w-0">
+            <p id="np-name" class="font-display font-600 truncate">Nothing playing</p>
+            <p id="np-group" class="text-xs text-faint font-mono truncate">—</p>
+          </div>
+          <button id="btn-fav-current" disabled title="Add to favorites"
+            class="ml-auto p-2 rounded-md text-faint hover:text-accent hover:bg-panel2 transition disabled:opacity-30 disabled:pointer-events-none">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 17.3 6.2 20.6l1.1-6.5L2.5 9.4l6.6-1L12 2.5l2.9 5.9 6.6 1-4.8 4.7 1.1 6.5z"/></svg>
+          </button>
+        </div>
+      </section>
+
+      <!-- CHANNEL BROWSER -->
+      <section class="px-3 sm:px-4 pb-6">
+        <div class="flex items-center justify-between mb-2">
+          <h2 id="channel-list-title" class="font-display text-sm font-600 text-muted">All Channels</h2>
+          <span id="channel-count" class="text-xs font-mono text-faint">0 channels</span>
+        </div>
+
+        <div id="channel-empty" class="hidden border border-dashed border-hairline rounded-lg p-10 text-center">
+          <p class="text-muted font-display">No channels to show</p>
+          <p class="text-faint text-sm mt-1">Load a playlist from Settings, or adjust your search / group filter.</p>
+          <button id="btn-empty-open-settings" class="mt-4 px-4 py-2 rounded-md bg-accent text-black text-sm font-600 hover:brightness-110 transition">Load a playlist</button>
+        </div>
+
+        <div id="channel-grid" class="grid gap-3 grid-cols-2 sm:grid-cols-3 md:grid-cols-4 xl:grid-cols-5"></div>
+      </section>
+    </main>
+  </div>
+
+  <!-- ============================================================
+       SETTINGS MODAL
+       Playlist source (URL or file), CORS proxy configuration.
+  ============================================================ -->
+  <div id="settings-backdrop" class="fixed inset-0 bg-black/70 z-50 hidden items-center justify-center p-4">
+    <div class="bg-panel border border-hairline rounded-lg w-full max-w-lg max-h-[90vh] overflow-y-auto">
+      <div class="flex items-center justify-between p-4 border-b border-hairline">
+        <h2 class="font-display font-600">Playlist &amp; Connection</h2>
+        <button id="btn-close-settings" class="p-1 text-faint hover:text-ink">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18M6 6l12 12"/></svg>
+        </button>
+      </div>
+
+      <div class="p-4 space-y-6">
+
+        <!-- M3U URL -->
+        <div>
+          <label class="text-xs font-mono uppercase tracking-wide text-faint" for="input-m3u-url">M3U Playlist URL</label>
+          <div class="flex gap-2 mt-1.5">
+            <input id="input-m3u-url" type="text" placeholder="https://example.com/playlist.m3u"
+              class="flex-1 bg-panel2 border border-hairline rounded-md px-3 py-2 text-sm placeholder:text-faint focus:border-accent transition" />
+            <button id="btn-load-url" class="px-3 py-2 rounded-md bg-accent text-black text-sm font-600 hover:brightness-110 transition whitespace-nowrap">Load</button>
+          </div>
+        </div>
+
+        <div class="flex items-center gap-2">
+          <div class="h-px bg-hairline flex-1"></div>
+          <span class="text-xs text-faint font-mono">OR</span>
+          <div class="h-px bg-hairline flex-1"></div>
+        </div>
+
+        <!-- Local file -->
+        <div>
+          <label class="text-xs font-mono uppercase tracking-wide text-faint">Upload local .m3u / .m3u8 file</label>
+          <label for="input-m3u-file" class="mt-1.5 flex items-center justify-center gap-2 border border-dashed border-hairline rounded-md px-3 py-4 text-sm text-muted hover:border-accent hover:text-ink cursor-pointer transition">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12"/></svg>
+            <span id="file-input-label">Choose a file…</span>
+          </label>
+          <input id="input-m3u-file" type="file" accept=".m3u,.m3u8,text/plain" class="hidden" />
+        </div>
+
+        <!-- CORS proxy -->
+        <div class="pt-2 border-t border-hairline">
+          <label class="text-xs font-mono uppercase tracking-wide text-faint" for="input-cors-proxy">CORS Proxy URL (optional)</label>
+          <input id="input-cors-proxy" type="text" placeholder="https://your-proxy.example.com/"
+            class="w-full mt-1.5 bg-panel2 border border-hairline rounded-md px-3 py-2 text-sm placeholder:text-faint focus:border-accent transition" />
+          <p class="text-xs text-faint mt-2 leading-relaxed">
+            Because this app runs entirely in your browser with no server of its own, playlist and stream
+            hosts must explicitly allow cross-origin requests (CORS). If loading fails, a proxy that adds
+            those headers is prepended to the URL, e.g.
+            <code class="font-mono text-[11px] bg-panel2 border border-hairline rounded px-1 py-0.5">https://proxy.example.com/https://playlist-host.com/list.m3u</code>.
+            You are responsible for the proxy you choose — do not send sensitive playlist URLs to a proxy you don't trust.
+          </p>
+
+          <label class="flex items-center gap-2 mt-3 text-sm text-muted">
+            <input id="input-apply-proxy-streams" type="checkbox" class="accent-accent w-4 h-4" />
+            Also apply this proxy to individual stream (.m3u8) URLs
+          </label>
+        </div>
+
+        <div class="flex justify-between items-center pt-2 border-t border-hairline">
+          <button id="btn-clear-data" class="text-xs text-danger/80 hover:text-danger transition">Clear saved data</button>
+          <button id="btn-save-settings" class="px-4 py-2 rounded-md bg-panel2 border border-hairline text-sm font-600 hover:border-accent transition">Save &amp; Close</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+<script>
+/* ================================================================
+   SIGNAL — client-side IPTV player
+   All logic lives in this single script block: parsing, playback,
+   rendering, persistence. No build step, no backend.
+================================================================ */
+(function () {
+  'use strict';
+
+  // ----------------------------------------------------------------
+  // STORAGE KEYS
+  // Everything the app needs to restore on refresh lives under one
+  // prefix in localStorage so it's easy to find/clear.
+  // ----------------------------------------------------------------
+  const LS = {
+    URL: 'signal:lastM3uUrl',
+    PROXY: 'signal:corsProxy',
+    APPLY_PROXY_STREAMS: 'signal:applyProxyToStreams',
+    FAVORITES: 'signal:favorites',
+    VIEW_MODE: 'signal:viewMode',
+  };
+
+  // ----------------------------------------------------------------
+  // APPLICATION STATE
+  // ----------------------------------------------------------------
+  const state = {
+    channels: [],            // full parsed channel list
+    groups: [],               // unique group names, in first-seen order
+    activeGroup: 'All Channels',
+    searchTerm: '',
+    viewMode: localStorage.getItem(LS.VIEW_MODE) || 'grid', // 'grid' | 'list'
+    favorites: new Set(JSON.parse(localStorage.getItem(LS.FAVORITES) || '[]')),
+    corsProxy: localStorage.getItem(LS.PROXY) || '',
+    applyProxyToStreams: localStorage.getItem(LS.APPLY_PROXY_STREAMS) === 'true',
+    currentChannel: null,
+    hls: null,                // active Hls.js instance, if any
+  };
+
+  // ----------------------------------------------------------------
+  // DOM REFERENCES
+  // ----------------------------------------------------------------
+  const el = {
+    sidebar: document.getElementById('sidebar'),
+    sidebarBackdrop: document.getElementById('sidebar-backdrop'),
+    btnToggleSidebar: document.getElementById('btn-toggle-sidebar'),
+    groupList: document.getElementById('group-list'),
+    playlistSummary: document.getElementById('playlist-summary'),
+
+    search: document.
